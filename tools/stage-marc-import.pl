@@ -30,38 +30,26 @@ use Modern::Perl;
 use CGI qw ( -utf8 );
 use CGI::Cookie;
 use MARC::File::USMARC;
+use JSON qw( encode_json );
 
 # Koha modules used
 use C4::Context;
 use C4::Auth;
 use C4::Output;
 use C4::Biblio;
-use C4::ImportBatch;
 use C4::Matcher;
 use Koha::UploadedFiles;
-use C4::BackgroundJob;
 use C4::MarcModificationTemplates;
 use Koha::Plugins;
 use Koha::ImportBatches;
+use Koha::BackgroundJob::MARCImport;
 
 my $input = CGI->new;
 
-my $fileID                     = $input->param('uploadedfileid');
-my $runinbackground            = $input->param('runinbackground');
-my $completedJobID             = $input->param('completedJobID');
-my $matcher_id                 = $input->param('matcher');
-my $overlay_action             = $input->param('overlay_action');
-my $nomatch_action             = $input->param('nomatch_action');
-my $parse_items                = $input->param('parse_items');
-my $item_action                = $input->param('item_action');
-my $comments                   = $input->param('comments');
-my $record_type                = $input->param('record_type');
-my $encoding                   = $input->param('encoding') || 'UTF-8';
-my $format                     = $input->param('format') || 'ISO2709';
-my $marc_modification_template = $input->param('marc_modification_template_id');
-my $basketno                   = $input->param('basketno');
-my $booksellerid               = $input->param('booksellerid');
-my $profile_id                 = $input->param('profile_id');
+my %params = map { $_ => scalar $input->param($_) } qw(uploadedfileid matcher overlay_action nomatch_action parse_items item_action comments record_type encoding format marc_modification_template_id basketno booksellerid profile_id);
+$params{encoding} ||= 'UTF-8';
+$params{format}   ||=  'ISO2709';
+my $fileID = $params{uploadedfileid};
 
 my ( $template, $loggedinuser, $cookie ) = get_template_and_user(
     {
@@ -74,144 +62,49 @@ my ( $template, $loggedinuser, $cookie ) = get_template_and_user(
 );
 
 $template->param(
-    SCRIPT_NAME => '/cgi-bin/koha/tools/stage-marc-import.pl',
-    uploadmarc  => $fileID,
-    record_type => $record_type,
-    basketno => $basketno,
-    booksellerid => $booksellerid,
+    SCRIPT_NAME  => '/cgi-bin/koha/tools/stage-marc-import.pl',
+    uploadmarc   => $fileID,
+    record_type  => $params{record_type},
+    basketno     => $params{basketno},
+    booksellerid => $params{booksellerid},
 );
 
-my %cookies = parse CGI::Cookie($cookie);
-my $sessionID = $cookies{'CGISESSID'}->value;
-if ($completedJobID) {
-    my $job = C4::BackgroundJob->fetch($sessionID, $completedJobID);
-    my $results = $job->results();
-    $template->param(map { $_ => $results->{$_} } keys %{ $results });
-} elsif ($fileID) {
+if ($fileID) {
     my $upload = Koha::UploadedFiles->find( $fileID );
-    my $file = $upload->full_path;
-    my $filename = $upload->filename;
+    $params{file} = $upload->full_path;
+    $params{filename} = $upload->filename;
 
-    my ( $errors, $marcrecords );
-    if( $format eq 'MARCXML' ) {
-        ( $errors, $marcrecords ) = C4::ImportBatch::RecordsFromMARCXMLFile( $file, $encoding);
-    } elsif( $format eq 'ISO2709' ) {
-        ( $errors, $marcrecords ) = C4::ImportBatch::RecordsFromISO2709File( $file, $record_type, $encoding );
-    } else { # plugin based
-        $errors = [];
-        $marcrecords = C4::ImportBatch::RecordsFromMarcPlugin( $file, $format, $encoding );
+    #warn "$filename: " . ( join ',', @$errors ) if @$errors;
+
+    my $job_id = Koha::BackgroundJob::MARCImport->new->enqueue(\%params);
+    if ($job_id) {
+        $template->param(
+            view => 'enqueued',
+            job_id => $job_id,
+        );
     }
-    warn "$filename: " . ( join ',', @$errors ) if @$errors;
-        # no need to exit if we have no records (or only errors) here
-        # BatchStageMarcRecords can handle that
-
-    my $job = undef;
-    my $dbh;
-    if ($runinbackground) {
-        my $job_size = scalar(@$marcrecords);
-        # if we're matching, job size is doubled
-        $job_size *= 2 if ($matcher_id ne "");
-        $job = C4::BackgroundJob->new($sessionID, $filename, '/cgi-bin/koha/tools/stage-marc-import.pl', $job_size);
-        my $jobID = $job->id();
-
-        # fork off
-        if (my $pid = fork) {
-            # parent
-            # return job ID as JSON
-            my $reply = CGI->new("");
-            print $reply->header(-type => 'text/html');
-            print '{"jobID":"' . $jobID . '"}';
-            exit 0;
-        } elsif (defined $pid) {
-            # child
-            # close STDOUT/STDERR to signal to end CGI session with Apache
-            # Otherwise, the AJAX request to this script won't return properly
-            close STDOUT;
-            close STDERR;
-        } else {
-            # fork failed, so exit immediately
-            warn "fork failed while attempting to run tools/stage-marc-import.pl as a background job: $!";
-            exit 0;
-        }
-
-        # if we get here, we're a child that has detached
-        # itself from Apache
-
+    else {
+        # push @messages, {
+        #     type => 'error',
+        #     code => 'cannot_enqueue_job',
+        #     error => "no job id ??",
+        # };
+        $template->param( view => 'errors' );
     }
 
-    # New handle, as we're a child.
-    $dbh = C4::Context->dbh({new => 1});
-    $dbh->{AutoCommit} = 0;
-    # FIXME branch code
-    my ( $batch_id, $num_valid, $num_items, @import_errors ) =
-      BatchStageMarcRecords(
-        $record_type,    $encoding,
-        $marcrecords,    $filename,
-        $marc_modification_template,
-        $comments,       '',
-        $parse_items,    0,
-        50, staging_progress_callback( $job, $dbh )
-      );
-
-    if($profile_id) {
-        my $ibatch = Koha::ImportBatches->find($batch_id);
-        $ibatch->set({profile_id => $profile_id})->store;
-    }
-
-    my $num_with_matches = 0;
-    my $checked_matches = 0;
-    my $matcher_failed = 0;
-    my $matcher_code = "";
-    if ($matcher_id ne "") {
-        my $matcher = C4::Matcher->fetch($matcher_id);
-        if (defined $matcher) {
-            $checked_matches = 1;
-            $matcher_code = $matcher->code();
-            $num_with_matches =
-              BatchFindDuplicates( $batch_id, $matcher, 10, 50,
-                matching_progress_callback( $job, $dbh ) );
-            SetImportBatchMatcher($batch_id, $matcher_id);
-            SetImportBatchOverlayAction($batch_id, $overlay_action);
-            SetImportBatchNoMatchAction($batch_id, $nomatch_action);
-            SetImportBatchItemAction($batch_id, $item_action);
-            $dbh->commit();
-        } else {
-            $matcher_failed = 1;
-        }
-    } else {
-        $dbh->commit();
-    }
-
-    my $results = {
-        staged          => $num_valid,
-        matched         => $num_with_matches,
-        num_items       => $num_items,
-        import_errors   => scalar(@import_errors),
-        total           => $num_valid + scalar(@import_errors),
-        checked_matches => $checked_matches,
-        matcher_failed  => $matcher_failed,
-        matcher_code    => $matcher_code,
-        import_batch_id => $batch_id,
-        booksellerid    => $booksellerid,
-        basketno        => $basketno
-    };
-    if ($runinbackground) {
-        $job->finish($results);
-        exit 0;
-    } else {
-	    $template->param(staged => $num_valid,
- 	                     matched => $num_with_matches,
-                         num_items => $num_items,
-                         import_errors => scalar(@import_errors),
-                         total => $num_valid + scalar(@import_errors),
-                         checked_matches => $checked_matches,
-                         matcher_failed => $matcher_failed,
-                         matcher_code => $matcher_code,
-                         import_batch_id => $batch_id,
-                         booksellerid => $booksellerid,
-                         basketno => $basketno
-                        );
-    }
+         # domm - not sure abnout this	    $template->param(staged => $num_valid,
+         # domm - not sure abnout this 	                     matched => $num_with_matches,
+         # domm - not sure abnout this                         num_items => $num_items,
+         # domm - not sure abnout this                         import_errors => scalar(@import_errors),
+         # domm - not sure abnout this                         total => $num_valid + scalar(@import_errors),
+         # domm - not sure abnout this                         checked_matches => $checked_matches,
+         # domm - not sure abnout this                         matcher_failed => $matcher_failed,
+         # domm - not sure abnout this                         matcher_code => $matcher_code,
+         # domm - not sure abnout this                         import_batch_id => $batch_id,
+         # domm - not sure abnout this                         booksellerid => $booksellerid,
+         # domm - not sure abnout this                         basketno => $basketno
+         # domm - not sure abnout this                        );
+         # domm - not sure abnout this    }
 
 } else {
     # initial form
@@ -237,21 +130,4 @@ output_html_with_http_headers $input, $cookie, $template->output;
 
 exit 0;
 
-sub staging_progress_callback {
-    my $job = shift;
-    my $dbh = shift;
-    return sub {
-        my $progress = shift;
-        $job->progress($progress);
-    }
-}
 
-sub matching_progress_callback {
-    my $job = shift;
-    my $dbh = shift;
-    my $start_progress = $job->progress();
-    return sub {
-        my $progress = shift;
-        $job->progress($start_progress + $progress);
-    }
-}

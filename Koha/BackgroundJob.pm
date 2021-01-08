@@ -26,6 +26,7 @@ use Koha::DateUtils qw( dt_from_string );
 use Koha::Exceptions;
 use Koha::BackgroundJob::BatchUpdateBiblio;
 use Koha::BackgroundJob::BatchUpdateAuthority;
+use Koha::BackgroundJob::MARCImport;
 
 use base qw( Koha::Object );
 
@@ -133,15 +134,21 @@ Process the job!
 
 =cut
 
+my %TypeToClass = (
+    batch_biblio_record_modification=>'Koha::BackgroundJob::BatchUpdateBiblio',
+    batch_authority_record_modification=>'Koha::BackgroundJob::BatchUpdateAuthority',
+    marc_import=>'Koha::BackgroundJob::MARCImport',
+);
+
 sub process {
     my ( $self, $args ) = @_;
 
     my $job_type = $self->type;
-    return $job_type eq 'batch_biblio_record_modification'
-      ? Koha::BackgroundJob::BatchUpdateBiblio->process($args)
-      : $job_type eq 'batch_authority_record_modification'
-      ? Koha::BackgroundJob::BatchUpdateAuthority->process($args)
-      : Koha::Exceptions::Exception->throw('->process called without valid job_type');
+    my $class = $TypeToClass{$job_type};
+    unless ($class) {
+        Koha::Exceptions::Exception->throw('->process called without valid job_type HAEW')
+    }
+    return $class->process($args);
 }
 
 =head3 job_type
